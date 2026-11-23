@@ -1,0 +1,381 @@
+name: SSDLC - VidaPlus
+
+# Pipeline de seguranca do projeto. Cada job e um GATE mapeado a uma fase do SSDLC.
+# No legado, quase todos os gates ficam VERMELHOS de proposito (informativo).
+# Conforme os grupos corrigem, os gates ficam VERDES. Para tornar um gate BLOQUEANTE,
+# remova o 'continue-on-error: true' correspondente (ver docs/06-pipeline-cicd.md).
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # para publicar SARIF (CodeQL/Semgrep) na aba Security
+
+jobs:
+
+  # ---------- Fase 4/5: build ----------
+  build-backend:
+    name: Build backend (Maven)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      # F-10: depois da correcao, a chave do token vem do ambiente (JWT_SECRET). Cada execucao
+      # gera uma chave nova e descartavel: nenhuma chave fica gravada no repositorio.
+      - name: Chave do token so para este teste
+        run: |
+          K=$(openssl rand -hex 32); echo "::add-mask::$K"; echo "JWT_SECRET=$K" >> "$GITHUB_ENV"
+      - name: Compilar e testar (exclui testes @security, que rodam no gate proprio com MySQL)
+        working-directory: legacy-app/backend
+        run: mvn -B -q verify -DexcludedGroups=security
+
+  build-frontend:
+    name: Build frontend (React)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Instalar e build
+        working-directory: legacy-app/frontend
+        run: |
+          npm install || true
+          npm run build || echo "build incompleto (esperado no legado)"
+
+  # ---------- Gate: Secret Scanning (V-05) - LGPD art. 46 ----------
+  secret-scan:
+    name: "Gate - Secret Scanning (Gitleaks)"
+    runs-on: ubuntu-latest
+    continue-on-error: true    # informativo no legado; deve acusar application.properties/JwtUtil
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      # CLI em Docker (o mesmo comando dos roteiros). A gitleaks-action@v2 exige licenca paga
+      # em repositorios de organizacao e, sem ela, sai sem varrer nada.
+      # Varre so o historico da pasta legacy-app (o sistema); --redact esconde os valores no log.
+      - name: Gitleaks
+        run: |
+          docker run --rm -v "$PWD":/repo zricethezav/gitleaks:v8.21.2 \
+            detect --source /repo --config /repo/security/gitleaks/gitleaks.toml \
+            --log-opts="--all -- legacy-app" --no-banner --redact -v
+
+  # ---------- Gate: SAST (V-01,V-02,V-07,V-10) ----------
+  sast-semgrep:
+    name: "Gate - SAST (Semgrep)"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container: returntocorp/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep (regras OWASP + Java + custom)
+        run: semgrep scan --config p/owasp-top-ten --config p/java --config security/semgrep/vidaplus.yml --sarif --output semgrep.sarif || true
+      - uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: semgrep.sarif }
+
+  sast-codeql:
+    name: "Gate - SAST (CodeQL)"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with: { languages: "java,javascript" }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21" }
+      - name: Build para CodeQL
+        working-directory: legacy-app/backend
+        run: mvn -B -q -DskipTests package
+      - uses: github/codeql-action/analyze@v3
+
+  # ---------- Gate: SCA / dependencias - higiene de supply chain ----------
+  sca:
+    name: "Gate - SCA (Dependency-Check + Trivy)"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: vidaplus
+          path: legacy-app
+          format: SARIF
+          args: >-
+            --suppression security/dependency-check/suppression.xml
+            --failOnCVSS 7
+      - name: Trivy (filesystem + libs)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: legacy-app
+          severity: HIGH,CRITICAL
+          exit-code: "0"     # informativo no legado
+
+  # ---------- Gate: Container Scanning (imagens backend/frontend) ----------
+  container-scan:
+    name: "Gate - Container Scanning (Trivy image)"
+    runs-on: ubuntu-latest
+    continue-on-error: true    # informativo no legado; CVEs na imagem base/SO
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build das imagens
+        run: |
+          docker build -t vidaplus-backend:ci legacy-app/backend
+          docker build -t vidaplus-frontend:ci legacy-app/frontend
+      - name: Trivy - imagem do backend
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: vidaplus-backend:ci
+          severity: HIGH,CRITICAL
+          exit-code: "0"     # vira "1" quando o grupo tornar o gate bloqueante
+      - name: Trivy - imagem do frontend
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: vidaplus-frontend:ci
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+  # ---------- Gate: SBOM (Fase 6) ----------
+  sbom:
+    name: "SBOM (CycloneDX)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gerar SBOM com Syft
+        uses: anchore/sbom-action@v0
+        with:
+          path: legacy-app
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with: { name: sbom, path: sbom.cdx.json }
+
+  # ---------- Gate: DAST autenticado (V-03 IDOR, V-09, V-12) - roda contra a app viva ----------
+  dast-zap:
+    name: "Gate - DAST autenticado (OWASP ZAP)"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      # F-10: depois da correcao, o docker-compose le as senhas e a chave do legacy-app/.env
+      # (fora do Git). Aqui, cada execucao cria um .env com valores novos e descartaveis.
+      - name: Segredos descartaveis deste ambiente (legacy-app/.env)
+        working-directory: legacy-app
+        run: |
+          printf 'MYSQL_ROOT_PASSWORD=%s\nDB_PASSWORD=%s\nJWT_SECRET=%s\n' \
+            "$(openssl rand -hex 16)" "$(openssl rand -hex 16)" "$(openssl rand -hex 32)" > .env
+      - name: Subir ambiente
+        working-directory: legacy-app
+        run: |
+          docker compose up -d --build
+          echo "aguardando API..."; sleep 40
+      - name: Obter token JWT (usuario de teste)
+        id: auth
+        # Login do seed (ver legacy-app/db/seed.sql). Ajuste se o grupo mudar o endpoint/credenciais.
+        run: |
+          TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"dra.house@vidaplus.local","senha":"Medico123"}' | jq -r '.access_token // empty')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+      - name: "ZAP Baseline autenticado (injeta header Authorization)"
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: "http://localhost:8080"
+          rules_file_name: security/zap/rules.tsv
+          # -a: alfa rules; replacer: adiciona o header Authorization em toda requisicao,
+          # permitindo o ZAP navegar endpoints autenticados e exercitar o IDOR (V-03).
+          cmd_options: >-
+            -a -z "-config replacer.full_list(0).description=auth
+            -config replacer.full_list(0).enabled=true
+            -config replacer.full_list(0).matchtype=REQ_HEADER
+            -config replacer.full_list(0).matchstr=Authorization
+            -config replacer.full_list(0).regex=false
+            -config replacer.full_list(0).replacement=Bearer ${{ steps.auth.outputs.token }}"
+      - name: Derrubar ambiente
+        if: always()
+        working-directory: legacy-app
+        run: docker compose down -v
+
+  # ---------- Gate: testes de seguranca (IDOR/RBAC/SQLi no login) ----------
+  security-tests:
+    name: "Gate - Testes de seguranca"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root123
+          MYSQL_DATABASE: vidaplus
+        ports:
+          - "3306:3306"
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot123"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21", cache: maven }
+      - name: Carregar schema + seed no MySQL de teste
+        run: |
+          sudo apt-get update && sudo apt-get install -y mysql-client
+          mysql -h127.0.0.1 -uroot -proot123 < legacy-app/db/schema.sql
+          mysql -h127.0.0.1 -uroot -proot123 vidaplus < legacy-app/db/seed.sql
+      # F-10: depois da correcao, a chave do token vem do ambiente (JWT_SECRET). Cada execucao
+      # gera uma chave nova e descartavel: nenhuma chave fica gravada no repositorio.
+      - name: Chave do token so para este teste
+        run: |
+          K=$(openssl rand -hex 32); echo "::add-mask::$K"; echo "JWT_SECRET=$K" >> "$GITHUB_ENV"
+      - name: Testes de aceite de seguranca (@Tag security)
+        working-directory: legacy-app/backend
+        # No legado FALHA de proposito (gate vermelho); fica verde quando corrigido.
+        run: mvn -B -q test -Dgroups=security
+
+  # ==================================================================
+  # CD — assinatura, verificacao e promocao (so na branch main).
+  # Tudo PRE-FIADO e ZERO-CONFIG (usa OIDC + GITHUB_TOKEN, sem segredos).
+  # O aluno NAO configura ferramenta: apenas observa, torna bloqueante,
+  # verifica e EXPLICA no dossie. Ver docs/06-pipeline-cicd.md.
+  # ==================================================================
+
+  # ---------- Release: build once -> push -> assinar -> atestar o SBOM (sem proveniencia: ainda nao e SLSA L2) ----------
+  release-sign:
+    name: "Release - build, push, sign & attest SBOM"
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: [build-backend]
+    permissions:
+      contents: read
+      packages: write      # publicar no GHCR
+      id-token: write      # OIDC keyless (cosign)
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        # O GHCR so aceita nome em minusculas (o repositorio-modelo se chama "SSC").
+        run: |
+          REPO="${{ github.repository }}"
+          echo "image=ghcr.io/${REPO,,}/vidaplus-backend" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: legacy-app/backend
+          push: true
+          tags: ${{ steps.meta.outputs.image }}:${{ github.sha }}
+      - uses: sigstore/cosign-installer@v3
+      - name: Assinar por digest (keyless)
+        run: cosign sign --yes "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+      - name: SBOM da imagem
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom-image.cdx.json
+      - name: Atestar o SBOM
+        run: cosign attest --yes --predicate sbom-image.cdx.json --type cyclonedx "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+
+  # ---------- Deploy staging (ambiente efemero + smoke) ----------
+  deploy-staging:
+    name: "Deploy staging + smoke"
+    runs-on: ubuntu-latest
+    needs: [release-sign]
+    environment: staging      # criado automaticamente; sem reviewer
+    steps:
+      - uses: actions/checkout@v4
+      # F-10: depois da correcao, o docker-compose le as senhas e a chave do legacy-app/.env
+      # (fora do Git). Aqui, cada execucao cria um .env com valores novos e descartaveis.
+      - name: Segredos descartaveis deste ambiente (legacy-app/.env)
+        working-directory: legacy-app
+        run: |
+          printf 'MYSQL_ROOT_PASSWORD=%s\nDB_PASSWORD=%s\nJWT_SECRET=%s\n' \
+            "$(openssl rand -hex 16)" "$(openssl rand -hex 16)" "$(openssl rand -hex 32)" > .env
+      - name: Subir a app (staging efemero) e checar saude
+        working-directory: legacy-app
+        run: |
+          docker compose up -d --build
+          echo "aguardando API..."; sleep 40
+          curl -fsS http://localhost:8080/ >/dev/null && echo "staging no ar" || echo "smoke incompleto (esperado no legado)"
+      - name: Derrubar ambiente
+        if: always()
+        working-directory: legacy-app
+        run: docker compose down -v
+
+  # ---------- Deploy prod: ADMISSION GATE (verifica assinatura) + APROVACAO manual ----------
+  deploy-prod:
+    name: "Deploy prod - verifica assinatura + aprovacao"
+    runs-on: ubuntu-latest
+    needs: [release-sign, deploy-staging]
+    environment: production   # defina 'required reviewers' em Settings -> Environments (1 passo)
+    permissions:
+      contents: read
+      packages: read          # ler a imagem/assinatura no GHCR (repo privado). Menor privilegio: sem id-token.
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@v3
+      # So promove imagem ASSINADA e ATESTADA por ESTE repositorio (estilo admission control).
+      - name: Verificar assinatura da imagem
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${{ needs.release-sign.outputs.image }}@${{ needs.release-sign.outputs.digest }}"
+      - name: Verificar atestacao do SBOM
+        # A verificacao (stderr) e o que importa; o payload DSSE (stdout, o SBOM inteiro)
+        # e descartado com > /dev/null para nao travar o streaming do log. timeout como rede de seguranca.
+        run: |
+          timeout 120 cosign verify-attestation --type cyclonedx \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${{ needs.release-sign.outputs.image }}@${{ needs.release-sign.outputs.digest }}" > /dev/null
+          echo "Atestacao do SBOM verificada."
+      - name: Promover para producao
+        # 'Deploy' simbolico (sem host externo): o valor pedagogico e o PORTAO -
+        # so passa imagem verificada, e so apos aprovacao manual do ambiente 'production'.
+        run: |
+          echo "Imagem assinada, atestada e aprovada. Promovendo para producao:"
+          echo "${{ needs.release-sign.outputs.image }}@${{ needs.release-sign.outputs.digest }}"
+
+  # ---------- Placar dos gates (resumo) ----------
+  gate-summary:
+    name: "Placar de gates SSDLC"
+    runs-on: ubuntu-latest
+    needs: [secret-scan, sast-semgrep, sca, container-scan, dast-zap, security-tests]
+    if: always()
+    steps:
+      - name: Resumo
+        run: |
+          echo "## Placar de gates SSDLC - VidaPlus" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Gate | Fase | Resultado |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret Scanning | 4/6 | ${{ needs.secret-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST (Semgrep)  | 4/5 | ${{ needs.sast-semgrep.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SCA             | 5/6 | ${{ needs.sca.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container Scan  | 5/6 | ${{ needs.container-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| DAST autenticado| 5   | ${{ needs.dast-zap.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Testes seg.     | 5   | ${{ needs.security-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Meta do semestre: mover cada gate de vermelho para verde." >> $GITHUB_STEP_SUMMARY

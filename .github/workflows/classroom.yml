@@ -1,0 +1,94 @@
+name: Autograding (Classroom)
+
+# Autograding do VidaPlus: nota parcial AUTOMATICA de apoio, alinhada ao que os grupos
+# implementam de fato (o recorte do projeto):
+#   1. F-10 (aula guiada, todos os grupos): a chave do token saiu do codigo (checagem estatica);
+#   2. o P0 do grupo: o cenario Gherkin @security do pacote passa (teste de comportamento, contra
+#      um MySQL de servico). E o mesmo comando do roteiros/comum/rodar-testes.sh.
+#
+# IMPORTANTE: e FEEDBACK, nao a nota final. A nota real vem dos artefatos (dossie) e da defesa
+# (ver docs/07-rubrica-avaliacao.md). As demais funcionalidades do pacote sao so ANALISADAS
+# (@analise) e nao entram aqui.
+#
+# O filtro do P0 (no "command" do passo "P0 do grupo") diz qual cenario e o P0 do grupo. O
+# professor ajusta em cada repositorio:
+#   G1 "security & F-01" | G2 "security & F-02" | G3 "security & F-03" | G4 "security & F-02"
+# Com "security" (valor do modelo), rodam os testes @security de todos os pacotes.
+# O filtro e a chave do token ficam DENTRO do command: o grader roda o comando num ambiente
+# reduzido, que nao recebe as variaveis do job (env: / GITHUB_ENV).
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+permissions:
+  checks: write
+  actions: read
+  contents: read
+
+jobs:
+  run-autograding-tests:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-classroom[bot]'
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root123
+          MYSQL_DATABASE: vidaplus
+        ports:
+          - "3306:3306"
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot123"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Carregar schema + seed
+        run: |
+          sudo apt-get update && sudo apt-get install -y mysql-client
+          mysql -h127.0.0.1 -uroot -proot123 < legacy-app/db/schema.sql
+          mysql -h127.0.0.1 -uroot -proot123 vidaplus < legacy-app/db/seed.sql
+
+      # ---------------- F-10 (aula guiada, todos os grupos) ----------------
+      - name: "F-10 / V-05 chave do token fora do codigo"
+        id: f10
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: "F-10 / V-05 JWT via variavel de ambiente (properties e JwtUtil)"
+          # A mesma verificacao do roteiros/comum/08 (Passo 3 e Passo 9).
+          command: >-
+            ! grep -qE 'jwt.secret=[^$]' legacy-app/backend/src/main/resources/application.properties
+            && ! grep -qE 'SECRET *= *"' legacy-app/backend/src/main/java/br/ifsul/vidaplus/security/JwtUtil.java
+          max-score: 40
+
+      # ---------------- P0 do grupo (prova a correcao) ----------------
+      - name: "P0 do grupo - cenario @security"
+        id: p0
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: "P0 do grupo: cenario Gherkin @security passa"
+          setup-command: ""
+          # JWT_SECRET: depois da F-10 a chave do token vem do ambiente; cada execucao sorteia uma
+          # nova e descartavel (nenhuma chave fica gravada no repositorio).
+          # Um filtro que nao acha nenhum cenario (ex.: retagueado para @analise) REPROVA: o
+          # Cucumber acusa "did not discover any tests".
+          command: >-
+            cd legacy-app/backend && export JWT_SECRET=$(openssl rand -hex 32)
+            && mvn -B -q test "-Dgroups=security"
+          timeout: 15
+          max-score: 60
+
+      # ---------------- Relatorio consolidado ----------------
+      - name: "Autograding Reporter"
+        uses: classroom-resources/autograding-grading-reporter@v1
+        env:
+          F10_RESULTS: "${{ steps.f10.outputs.result }}"
+          P0_RESULTS: "${{ steps.p0.outputs.result }}"
+        with:
+          runners: f10,p0

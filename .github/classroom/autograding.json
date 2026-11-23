@@ -1,0 +1,15 @@
+{
+  "//": "FALLBACK ESTATICO. O autograding ATIVO e .github/workflows/classroom.yml, que pontua (1) a F-10 (esta mesma checagem) e (2) o cenario @security do P0 do grupo, que precisa de um MySQL de servico e por isso so roda la. Este arquivo fica como documentacao/fallback.",
+  "tests": [
+    {
+      "name": "F-10 / V-05 JWT via variavel de ambiente (properties e JwtUtil)",
+      "setup": "",
+      "run": "! grep -qE 'jwt.secret=[^$]' legacy-app/backend/src/main/resources/application.properties && ! grep -qE 'SECRET *= *\"' legacy-app/backend/src/main/java/br/ifsul/vidaplus/security/JwtUtil.java && echo PASS",
+      "input": "",
+      "output": "PASS",
+      "comparison": "included",
+      "timeout": 1,
+      "points": 40
+    }
+  ]
+}
